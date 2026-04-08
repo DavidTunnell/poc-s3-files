@@ -110,6 +110,12 @@ mark { background: #2f6b3a; color: #fff; padding: 1px 2px; border-radius: 2px; }
 .path-col { font-size: 12px; color: #8b949e; }
 .path-col a { color: #8b949e; }
 .path-col a:hover { color: #58a6ff; }
+.pagination { display: flex; gap: 6px; margin-top: 16px; align-items: center;
+              justify-content: center; flex-wrap: wrap; padding: 12px; }
+.pagination .btn { min-width: 36px; text-align: center; cursor: pointer; user-select: none; }
+.pagination .btn.current { background: #238636; border-color: #2ea043; color: #fff; cursor: default; }
+.pagination .btn.disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+.pagination .page-info { color: #8b949e; font-size: 13px; margin: 0 8px; }
 """
 
 import subprocess
@@ -381,21 +387,22 @@ fetch('/api/search?bucket='+encodeURIComponent(bucketName)+'&q='+encodeURICompon
 
 import json as json_mod
 import threading
-PAGE_LIMIT = 200
+PAGE_SIZE = 200
 
-def list_dir_sync(full_path: str) -> dict:
-    """List directory contents. Returns JSON-serializable dict."""
-    dirs, files = [], []
-    truncated = False
+def list_dir_sync(full_path: str, page: int = 1) -> dict:
+    """List directory with pagination. Collects page*PAGE_SIZE entries, sorts, returns the requested page."""
+    all_dirs, all_files = [], []
+    target = page * PAGE_SIZE
     collected = 0
+    has_more = False
     try:
         with os.scandir(full_path) as it:
             for entry in it:
                 if entry.name.startswith(".s3files-lost"):
                     continue
                 collected += 1
-                if collected > PAGE_LIMIT:
-                    truncated = True
+                if collected > target:
+                    has_more = True
                     break
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
@@ -404,14 +411,26 @@ def list_dir_sync(full_path: str) -> dict:
                     continue
                 item = {"name": entry.name, "is_dir": is_dir, "size": st.st_size, "mtime": st.st_mtime}
                 if is_dir:
-                    dirs.append(item)
+                    all_dirs.append(item)
                 else:
-                    files.append(item)
+                    all_files.append(item)
     except PermissionError:
         pass
-    dirs.sort(key=lambda x: x["name"])
-    files.sort(key=lambda x: x["name"])
-    return {"dirs": dirs, "files": files, "truncated": truncated}
+    all_dirs.sort(key=lambda x: x["name"])
+    all_files.sort(key=lambda x: x["name"])
+    # Combine sorted dirs-first then files, slice to requested page
+    combined = all_dirs + all_files
+    start = (page - 1) * PAGE_SIZE
+    page_items = combined[start:start + PAGE_SIZE]
+    dirs_page = [x for x in page_items if x["is_dir"]]
+    files_page = [x for x in page_items if not x["is_dir"]]
+    total = len(combined)
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE if not has_more else None
+    return {
+        "dirs": dirs_page, "files": files_page,
+        "page": page, "page_size": PAGE_SIZE,
+        "total": total, "total_pages": total_pages, "has_more": has_more,
+    }
 
 def render_page(rel_path: str, full_path: str, message: str = "") -> str:
     msg_html = ""
@@ -479,31 +498,63 @@ function fmtTime(ts) {{
   return d.toISOString().replace('T',' ').replace(/\\.\\d+Z/,' UTC');
 }}
 
-fetch('/api/ls?path='+encodeURIComponent(relPath))
-  .then(r=>r.json())
-  .then(data=>{{
-    let rows='';
-    if(parentLink) rows+='<tr class="folder"><td><span class="icon">&#128193;</span> <a href="'+esc(parentLink)+'">..</a></td><td></td><td></td><td></td></tr>';
-    for(const d of data.dirs) {{
-      const link=actionUrl+encodeURIComponent(d.name)+'/';
-      rows+='<tr class="folder"><td><span class="icon">&#128193;</span> <a href="'+link+'">'+esc(d.name)+'/</a></td>'
-        +'<td class="size">-</td><td class="modified">'+fmtTime(d.mtime)+'</td>'
-        +'<td><form method="POST" action="'+link+'" onsubmit="return confirm(\\'Delete folder?\\')"><input type="hidden" name="action" value="delete"><button class="btn btn-danger" type="submit">Delete</button></form></td></tr>';
-    }}
-    for(const f of data.files) {{
-      const link=actionUrl+encodeURIComponent(f.name);
-      rows+='<tr class="file"><td><span class="icon">&#128196;</span> <a href="'+link+'">'+esc(f.name)+'</a></td>'
-        +'<td class="size">'+fmtSize(f.size)+'</td><td class="modified">'+fmtTime(f.mtime)+'</td>'
-        +'<td><form method="POST" action="'+link+'" onsubmit="return confirm(\\'Delete file?\\')"><input type="hidden" name="action" value="delete"><button class="btn btn-danger" type="submit">Delete</button></form></td></tr>';
-    }}
-    if(!rows) rows='<tr><td colspan="4" class="empty">Empty directory</td></tr>';
-    let h='<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table>';
-    if(data.truncated) h+='<div class="msg msg-ok" style="margin-top:12px">Showing first {PAGE_LIMIT} items. Use <strong>Search</strong> to find specific files.</div>';
-    document.getElementById('listing').innerHTML=h;
-  }})
-  .catch(e=>{{
-    document.getElementById('listing').innerHTML='<div class="msg msg-err">Failed to load: '+esc(e.message)+'</div>';
-  }});
+function loadPage(page) {{
+  document.getElementById('listing').innerHTML='<div class="loading"><span class="spinner"></span> Loading page '+page+'&hellip;</div>';
+  fetch('/api/ls?path='+encodeURIComponent(relPath)+'&page='+page)
+    .then(r=>r.json())
+    .then(data=>{{
+      let rows='';
+      if(parentLink && page===1) rows+='<tr class="folder"><td><span class="icon">&#128193;</span> <a href="'+esc(parentLink)+'">..</a></td><td></td><td></td><td></td></tr>';
+      for(const d of data.dirs) {{
+        const link=actionUrl+encodeURIComponent(d.name)+'/';
+        rows+='<tr class="folder"><td><span class="icon">&#128193;</span> <a href="'+link+'">'+esc(d.name)+'/</a></td>'
+          +'<td class="size">-</td><td class="modified">'+fmtTime(d.mtime)+'</td>'
+          +'<td><form method="POST" action="'+link+'" onsubmit="return confirm(\\'Delete folder?\\')"><input type="hidden" name="action" value="delete"><button class="btn btn-danger" type="submit">Delete</button></form></td></tr>';
+      }}
+      for(const f of data.files) {{
+        const link=actionUrl+encodeURIComponent(f.name);
+        rows+='<tr class="file"><td><span class="icon">&#128196;</span> <a href="'+link+'">'+esc(f.name)+'</a></td>'
+          +'<td class="size">'+fmtSize(f.size)+'</td><td class="modified">'+fmtTime(f.mtime)+'</td>'
+          +'<td><form method="POST" action="'+link+'" onsubmit="return confirm(\\'Delete file?\\')"><input type="hidden" name="action" value="delete"><button class="btn btn-danger" type="submit">Delete</button></form></td></tr>';
+      }}
+      if(!rows) rows='<tr><td colspan="4" class="empty">Empty directory</td></tr>';
+      let h='<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table>';
+
+      // Pagination controls
+      const pg = data.page;
+      const totalPages = data.total_pages;
+      const hasMore = data.has_more;
+      const showPag = totalPages === null ? hasMore : totalPages > 1;
+      if (showPag) {{
+        h += '<div class="pagination">';
+        h += '<span class="btn'+(pg<=1?' disabled':'')+'" onclick="'+(pg>1?'loadPage('+(pg-1)+')':'')+'">&laquo; Prev</span>';
+        // Page window: show first, last-known, and pages around current
+        const knownLast = totalPages || pg + 1;
+        const pages = new Set();
+        pages.add(1);
+        for (let i = Math.max(2, pg-2); i <= Math.min(knownLast, pg+2); i++) pages.add(i);
+        if (totalPages) pages.add(totalPages);
+        const sorted = [...pages].sort((a,b)=>a-b);
+        let prev = 0;
+        for (const p of sorted) {{
+          if (p - prev > 1) h += '<span class="page-info">&hellip;</span>';
+          h += '<span class="btn'+(p===pg?' current':'')+'" onclick="'+(p!==pg?'loadPage('+p+')':'')+'">'+p+'</span>';
+          prev = p;
+        }}
+        if (hasMore && !totalPages) h += '<span class="page-info">&hellip;</span>';
+        const canNext = hasMore || (totalPages && pg < totalPages);
+        h += '<span class="btn'+(canNext?'':' disabled')+'" onclick="'+(canNext?'loadPage('+(pg+1)+')':'')+'">Next &raquo;</span>';
+        h += '<span class="page-info">'+data.total.toLocaleString()+(hasMore?'+':'')+' items</span>';
+        h += '</div>';
+      }}
+      document.getElementById('listing').innerHTML=h;
+      window.scrollTo(0,0);
+    }})
+    .catch(e=>{{
+      document.getElementById('listing').innerHTML='<div class="msg msg-err">Failed to load: '+esc(e.message)+'</div>';
+    }});
+}}
+loadPage(1);
 </script></body></html>"""
 
 
@@ -527,9 +578,10 @@ class Handler(BaseHTTPRequestHandler):
         # API endpoint for async directory listing
         if path == "/api/ls":
             ls_path = qs.get("path", [""])[0]
+            page = max(1, int(qs.get("page", ["1"])[0]))
             full = safe_path(ls_path)
             if os.path.isdir(full):
-                data = list_dir_sync(full)
+                data = list_dir_sync(full, page=page)
                 body = json_mod.dumps(data).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
