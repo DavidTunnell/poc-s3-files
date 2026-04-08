@@ -249,6 +249,8 @@ def _search_s3_cli(bucket_name: str, query_lower: str, prefix: str) -> tuple:
 
 def highlight(text: str, query: str) -> str:
     """Highlight query matches in text (case-insensitive)."""
+    if not query:
+        return html.escape(text)
     lower = text.lower()
     q_lower = query.lower()
     out, i = [], 0
